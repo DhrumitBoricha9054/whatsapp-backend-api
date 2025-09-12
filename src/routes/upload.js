@@ -10,6 +10,12 @@ import { ensureDir, saveBuffer, publicPath, safeName } from '../utils/file.js';
 const router = Router();
 const upload = multer({ dest: 'tmp/' });
 
+// Normalize filenames for robust matching: lowercase, remove non-alnum except dot and hyphen
+function normalizeName(s) {
+  if (!s) return '';
+  return s.toString().toLowerCase().replace(/[^a-z0-9.\-\.]+/g, '');
+}
+
 /** Helper: find or create chat for user by participants set */
 async function findOrCreateChatForUser(userId, nameGuess, participantsSet, connection) {
   // Load all chats for user with their participants
@@ -107,38 +113,40 @@ router.post('/upload', auth, upload.single('zip'), async (req, res) => {
         let mediaPath = null;
 
         if (m.filename) {
-          // Try exact match first
-          let key = m.filename.toLowerCase();
-          let hit = filesMap.get(key);
-          
-          // If not found, try to find a file that ends with this filename
+          const rawName = m.filename;
+          const targetNorm = normalizeName(rawName);
+          let hit = null;
+          let foundZipKey = null;
+
+          // Try exact basename match (lowercased)
+          const exactKey = rawName.toLowerCase();
+          if (filesMap.has(exactKey)) {
+            hit = filesMap.get(exactKey);
+            foundZipKey = exactKey;
+          }
+
+          // Otherwise scan and match using normalized forms and suffix checks
           if (!hit) {
             for (const [zipFilename, fileData] of filesMap.entries()) {
-              if (zipFilename.endsWith(key)) {
+              const zipNorm = normalizeName(zipFilename);
+              // strong checks: exact normalized equality or normalized suffix/contains
+              if (
+                zipFilename.endsWith(exactKey) ||
+                zipNorm === targetNorm ||
+                zipNorm.includes(targetNorm) ||
+                targetNorm.includes(zipNorm)
+              ) {
                 hit = fileData;
-                key = zipFilename;
-                console.log(`Found media file with partial match: ${m.filename} -> ${zipFilename}`);
+                foundZipKey = zipFilename;
+                console.log(`Found media file with match: ${rawName} -> ${zipFilename}`);
                 break;
               }
             }
           }
-          
-          // If still not found, try case-insensitive partial matching
-          if (!hit) {
-            for (const [zipFilename, fileData] of filesMap.entries()) {
-              const zipLower = zipFilename.toLowerCase();
-              if (zipLower.includes(key) || key.includes(zipLower.split('.').pop())) {
-                hit = fileData;
-                key = zipFilename;
-                console.log(`Found media file with fuzzy match: ${m.filename} -> ${zipFilename}`);
-                break;
-              }
-            }
-          }
-          
+
           if (hit) {
             try {
-              const savedName = safeName(key); // Use the actual ZIP filename
+              const savedName = safeName(foundZipKey || exactKey); // Use the matched ZIP filename when possible
               const outPath = path.join(chatDir, savedName);
               await saveBuffer(outPath, hit.data);
               mediaPath = publicPath(String(userId), String(chatId), savedName);

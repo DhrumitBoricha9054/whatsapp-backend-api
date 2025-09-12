@@ -1,6 +1,7 @@
 // Robust WhatsApp .txt parser: handles common 12/24h, bracketed, multiline, attachments.
 const CLEAN_RE = /[\u200E\u200F\u202A-\u202E\u00A0\u202F]/g; // remove LTR/RTL, NBSPs
-const FILENAME_RE = /(?:<attached:\s*([^>]+)>|(?:\s|^)([A-Za-z0-9._-]+\.(?:jpg|jpeg|png|gif|mp4|mov|m4a|mp3|opus|pdf|docx?|xlsx?|pptx?)))/ig;
+// match either: <attached: ...> (captures everything until >) OR a bare filename (allow spaces, parentheses)
+const FILENAME_RE = /(?:<attached:\s*([^>]+)>|(?:\s|^)([A-Za-z0-9._\-\s()]+\.(?:jpg|jpeg|png|gif|mp4|mov|m4a|mp3|opus|pdf|docx?|xlsx?|pptx?)))/i;
 
 // Try a few formats, e.g.:
 // "24/07/25, 10:15 pm - Name: message"
@@ -62,12 +63,12 @@ export function parseWhatsAppText(txt, filePath = 'chat.txt') {
     let type = 'text';
     let filename = null;
 
-    let match;
-    while ((match = FILENAME_RE.exec(rec.content)) !== null) {
+    // Use match() (non-global regex) to avoid lastIndex state issues across messages
+    const match = rec.content.match(FILENAME_RE);
+    if (match) {
       filename = (match[1] || match[2] || '').trim();
       if (filename) {
         console.log(`Extracted filename from message: "${filename}" from content: "${rec.content.substring(0, 100)}..."`);
-        break;
       }
     }
     if (filename) {
