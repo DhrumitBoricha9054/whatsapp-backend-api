@@ -46,7 +46,7 @@ function parseDate(d, t) {
 }
 
 /** Returns { nameGuess, participants:Set, messages:[{author, content, timestamp, type, filename}] } */
-export function parseWhatsAppText(txt, filePath = 'chat.txt') {
+function parseWhatsAppText(txt, filePath = 'chat.txt') {
   console.log(`Parsing WhatsApp text from ${filePath}, ${txt.length} characters`);
   const lines = txt.replace(CLEAN_RE, '').split(/\r?\n/);
   console.log(`Split into ${lines.length} lines`);
@@ -134,3 +134,5 @@ export function parseWhatsAppText(txt, filePath = 'chat.txt') {
 
   return { nameGuess, participants, messages };
 }
+
+exports.parseWhatsAppText = parseWhatsAppText;

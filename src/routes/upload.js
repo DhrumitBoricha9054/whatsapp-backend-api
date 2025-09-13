@@ -1,11 +1,11 @@
-import { Router } from 'express';
-import multer from 'multer';
-import path from 'path';
-import { pool } from '../db.js';
-import { auth } from '../middleware/auth.js';
-import { loadZip, extractZipMeta } from '../utils/zip.js';
-import { parseWhatsAppText } from '../utils/parseWhatsApp.js';
-import { ensureDir, saveBuffer, publicPath, safeName } from '../utils/file.js';
+const { Router } = require('express');
+const multer = require('multer');
+const path = require('path');
+const { pool } = require('../db');
+const { auth } = require('../middleware/auth');
+const { loadZip, extractZipMeta } = require('../utils/zip');
+const { parseWhatsAppText } = require('../utils/parseWhatsApp');
+const { ensureDir, saveBuffer, publicPath, safeName } = require('../utils/file');
 
 const router = Router();
 const upload = multer({ dest: 'tmp/' });
@@ -199,4 +199,4 @@ router.post('/upload', auth, upload.single('zip'), async (req, res) => {
   }
 });
 
-export default router;
+module.exports = router;
