@@ -3,6 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "description": "Minimal Node.js API scaffold with Express and PostgreSQL",
+  "type": "module",
   "main": "src/server.js",
   "scripts": {
     "dev": "nodemon src/server.js",
