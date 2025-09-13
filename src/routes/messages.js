@@ -1,6 +1,6 @@
-const { Router } = require('express');
-const { pool } = require('../db');
-const { auth } = require('../middleware/auth');
+import { Router } from 'express';
+import { pool } from '../db.js';
+import { auth } from '../middleware/auth.js';
 
 const router = Router();
 
@@ -47,4 +47,4 @@ router.get('/chats/:id/messages', auth, async (req, res) => {
   res.json({ items: rows, total: Number(cntRows[0].cnt) });
 });
 
-module.exports = router;
+export default router;

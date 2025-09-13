@@ -1,8 +1,8 @@
-const { Router } = require('express');
-const { pool } = require('../db');
-const { auth } = require('../middleware/auth');
-const bcrypt = require('bcryptjs');
-const jwt = require('jsonwebtoken');
+import { Router } from 'express';
+import { pool } from '../db.js';
+import { auth } from '../middleware/auth.js';
+import bcrypt from 'bcryptjs';
+import jwt from 'jsonwebtoken';
 
 const router = Router();
 
@@ -46,4 +46,4 @@ router.post('/logout', auth, async (_req, res) => {
   res.json({ ok: true });
 });
 
-module.exports = router;
+export default router;

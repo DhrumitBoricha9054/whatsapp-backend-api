@@ -1,6 +1,6 @@
-const { Router } = require('express');
-const { pool, deleteChatsByIdsForUser } = require('../db');
-const { auth } = require('../middleware/auth');
+import { Router } from 'express';
+import { pool, deleteChatsByIdsForUser } from '../db.js';
+import { auth } from '../middleware/auth.js';
 
 const router = Router();
 
@@ -70,4 +70,4 @@ router.delete('/chats/:id', auth, async (req, res) => {
   res.json({ ok: true });
 });
 
-module.exports = router;
+export default router;
