@@ -1,14 +1,23 @@
 import 'dotenv/config';
 import 'express-async-errors';
 import express from 'express';
+import cors from 'cors';   // 👈 add this
 import path from 'path';
 import { fileURLToPath } from 'url';
+
 import authRoutes from './routes/auth.js';
 import chatRoutes from './routes/chats.js';
 import messageRoutes from './routes/messages.js';
 import uploadRoutes from './routes/upload.js';
 
 const app = express();
+
+// ✅ Enable CORS (allow frontend domain)
+app.use(cors({
+  origin: process.env.CLIENT_URL || "https://whatsapp-chat-render.vercel.app", // 👈 your frontend domain
+  credentials: true
+}));
+
 app.use(express.json());
 
 // static media (secured by path scoping; data ownership enforced at query time)
