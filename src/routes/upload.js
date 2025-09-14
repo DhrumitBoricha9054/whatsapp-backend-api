@@ -2,17 +2,18 @@ import { Router } from 'express';
 import multer from 'multer';
 import path from 'path';
 import fs from 'fs/promises';
+import fsSync from 'fs';
 import { pool } from '../db.js';
 import { auth } from '../middleware/auth.js';
-import { loadZip, extractZipMeta } from '../utils/zip.js';
+import JSZip from 'jszip';
 import { parseWhatsAppText } from '../utils/parseWhatsApp.js';
 import { ensureDir, saveBuffer, publicPath, safeName } from '../utils/file.js';
 
 const router = Router();
 
-// --- Multer disk storage with file size limit ---
+// --- Multer disk storage ---
 const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, 'tmp/'), // temp folder
+  destination: (req, file, cb) => cb(null, 'tmp/'),
   filename: (req, file, cb) => cb(null, Date.now() + '-' + file.originalname)
 });
 
@@ -34,8 +35,7 @@ async function findOrCreateChatForUser(userId, nameGuess, participantsSet, conne
 
   for (const c of chats) {
     const [rows] = await connection.execute('SELECT name FROM chat_participants WHERE chat_id = ?', [c.id]);
-    const set = new Set(rows.map(r => r.name));
-    chatParts.set(c.id, set);
+    chatParts.set(c.id, new Set(rows.map(r => r.name)));
   }
 
   const target = [...participantsSet].sort().join('|');
@@ -49,7 +49,10 @@ async function findOrCreateChatForUser(userId, nameGuess, participantsSet, conne
 
   if (foundId) return { chatId: foundId, created: false };
 
-  const [res] = await connection.execute('INSERT INTO chats (user_id, name) VALUES (?, ?)', [userId, nameGuess || 'Chat']);
+  const [res] = await connection.execute(
+    'INSERT INTO chats (user_id, name) VALUES (?, ?)',
+    [userId, nameGuess || 'Chat']
+  );
   const chatId = res.insertId;
 
   for (const p of participantsSet) {
@@ -59,44 +62,85 @@ async function findOrCreateChatForUser(userId, nameGuess, participantsSet, conne
   return { chatId, created: true };
 }
 
+// --- Load ZIP via stream (memory-efficient) ---
+async function loadZipStream(filePath) {
+  const zip = new JSZip();
+  const stream = fsSync.createReadStream(filePath);
+  return zip.loadAsync(stream);
+}
+
+// --- Extract files, streaming media to disk ---
+async function extractZipMetaStream(zip, uploadDir) {
+  const txtFiles = [];
+  const filesMap = new Map();
+
+  const entries = Object.values(zip.files);
+
+  for (const entry of entries) {
+    if (entry.dir) continue;
+
+    const lower = entry.name.toLowerCase();
+
+    if (lower.endsWith('.txt')) {
+      const text = await entry.async('string');
+      txtFiles.push({ path: entry.name, text });
+    } else {
+      // Save media file directly to disk
+      const safeOutName = safeName(path.basename(entry.name));
+      const outPath = path.join(uploadDir, safeOutName);
+      await ensureDir(path.dirname(outPath));
+
+      const buf = await entry.async('nodebuffer'); // Node.js Buffer
+      await fs.writeFile(outPath, buf);
+
+      filesMap.set(lower, { path: outPath });
+    }
+  }
+
+  return { txtFiles, filesMap };
+}
+
 // --- POST /upload ---
 router.post('/upload', auth, upload.single('zip'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'zip file required' });
+
   const userId = req.user.id;
+  const tempUploadDir = path.join('uploads', String(userId), 'tmp');
 
   try {
     console.log(`Processing ZIP upload for user ${userId}, file: ${req.file.originalname}`);
 
-    // Load ZIP from temp file (disk, not memory)
-    const zip = await loadZip(req.file.path);
-    const { txtFiles, filesMap } = await extractZipMeta(zip);
-    console.log(`Found ${txtFiles.length} txt files, ${filesMap.size} media files`);
+    // Load ZIP stream
+    const zip = await loadZipStream(req.file.path);
+
+    // Extract files: text + media (media saved directly)
+    const { txtFiles, filesMap } = await extractZipMetaStream(zip, tempUploadDir);
 
     if (!txtFiles.length) return res.status(400).json({ error: 'no .txt chat file found in zip' });
 
-    const stats = { addedChats: 0, updatedChats: 0, addedMessages: 0, skippedMessages: 0, savedMedia: 0 };
+    const stats = { addedChats: 0, updatedChats: 0, addedMessages: 0, skippedMessages: 0, savedMedia: filesMap.size };
 
     const conn = await pool.getConnection();
     try {
       await conn.beginTransaction();
 
       for (const { path: txtPath, text } of txtFiles) {
-        console.log(`\n=== Processing chat file: ${txtPath} ===`);
         const parsed = parseWhatsAppText(text, txtPath);
         const participantsSet = parsed.participants;
 
         const { chatId, created } = await findOrCreateChatForUser(userId, parsed.nameGuess, participantsSet, conn);
         if (created) stats.addedChats++; else stats.updatedChats++;
 
-        // Prepare uploads dir
         const root = process.env.UPLOAD_ROOT || 'uploads';
         const chatDir = path.join(root, String(userId), String(chatId));
         await ensureDir(chatDir);
 
-        // Last message timestamp to avoid duplicates
         let lastMessageTime = null;
         if (!created) {
-          const [lastMsg] = await conn.execute('SELECT MAX(timestamp) as last_time FROM messages WHERE chat_id = ?', [chatId]);
+          const [lastMsg] = await conn.execute(
+            'SELECT MAX(timestamp) as last_time FROM messages WHERE chat_id = ?',
+            [chatId]
+          );
           lastMessageTime = lastMsg[0]?.last_time;
         }
 
@@ -109,43 +153,14 @@ router.post('/upload', auth, upload.single('zip'), async (req, res) => {
         for (const m of newMessages) {
           let mediaPath = null;
           if (m.filename) {
-            const rawName = m.filename;
-            const targetNorm = normalizeName(rawName);
-            let hit = null;
-            let foundZipKey = null;
-
-            const exactKey = rawName.toLowerCase();
-            if (filesMap.has(exactKey)) {
-              hit = filesMap.get(exactKey);
-              foundZipKey = exactKey;
-            }
-
-            if (!hit) {
-              for (const [zipFilename, fileData] of filesMap.entries()) {
-                const zipNorm = normalizeName(zipFilename);
-                if (
-                  zipFilename.endsWith(exactKey) ||
-                  zipNorm === targetNorm ||
-                  zipNorm.includes(targetNorm) ||
-                  targetNorm.includes(zipNorm)
-                ) {
-                  hit = fileData;
-                  foundZipKey = zipFilename;
-                  break;
-                }
-              }
-            }
-
-            if (hit) {
-              try {
-                const savedName = safeName(foundZipKey || exactKey);
-                const outPath = path.join(chatDir, savedName);
-                await saveBuffer(outPath, hit.data);
-                mediaPath = publicPath(String(userId), String(chatId), savedName);
-                stats.savedMedia++;
-              } catch (mediaError) {
-                console.error(`Failed to save media file ${m.filename}:`, mediaError);
-              }
+            const key = m.filename.toLowerCase();
+            const fileEntry = filesMap.get(key);
+            if (fileEntry) {
+              const destName = safeName(path.basename(fileEntry.path));
+              const destPath = path.join(chatDir, destName);
+              await ensureDir(path.dirname(destPath));
+              await fs.copyFile(fileEntry.path, destPath);
+              mediaPath = publicPath(String(userId), String(chatId), destName);
             }
           }
 
@@ -180,8 +195,10 @@ router.post('/upload', auth, upload.single('zip'), async (req, res) => {
     console.error('Upload error:', error);
     res.status(500).json({ error: error.message || 'Upload failed' });
   } finally {
-    // Delete temp uploaded file
+    // Delete temp uploaded ZIP
     try { await fs.unlink(req.file.path); } catch {}
+    // Clean temporary uploaded media
+    try { await fs.rm(tempUploadDir, { recursive: true, force: true }); } catch {}
   }
 });
 
