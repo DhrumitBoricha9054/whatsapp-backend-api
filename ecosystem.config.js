@@ -1,7 +1,7 @@
 module.exports = {
   apps: [{
     name: 'whatsapp-api',
-    script: './app.js', // Change this to your main app file (could be index.js, server.js, etc.)
+    script: './server.js', // Change this to your main app file (could be index.js, server.js, etc.)
     instances: 1, // Single instance for file uploads
     exec_mode: 'fork',
     max_memory_restart: '1G',
