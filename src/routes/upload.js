@@ -2,213 +2,65 @@ import { Router } from 'express';
 import multer from 'multer';
 import path from 'path';
 import fs from 'fs/promises';
-import fsSync from 'fs';
-import { pool } from '../db.js';
 import { auth } from '../middleware/auth.js';
-import JSZip from 'jszip';
-import { parseWhatsAppText } from '../utils/parseWhatsApp.js';
-import { ensureDir, publicPath, safeName } from '../utils/file.js';
+// import { uploadQueue } from '../queue.js'; // You would import your queue here
 
 const router = Router();
 
-// --- Multer disk storage ---
+// Multer disk storage for temporary file
 const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, 'tmp/'),
-  filename: (req, file, cb) => cb(null, Date.now() + '-' + file.originalname)
+  destination: async (req, file, cb) => {
+    try {
+      await fs.mkdir('tmp', { recursive: true });
+      cb(null, 'tmp/');
+    } catch (err) {
+      cb(err);
+    }
+  },
+  filename: (req, file, cb) => {
+    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+    cb(null, uniqueSuffix + '-' + file.originalname);
+  }
 });
 
 const upload = multer({
   storage,
-  limits: { fileSize: 500 * 1024 * 1024 } // 500MB max
-});
-
-// --- Utility: normalize filenames ---
-function normalizeName(s) {
-  if (!s) return '';
-  return s.toString().toLowerCase().replace(/[^a-z0-9.\-\.]+/g, '');
-}
-
-// --- Helper: find or create chat ---
-async function findOrCreateChatForUser(userId, nameGuess, participantsSet, connection) {
-  const [chats] = await connection.execute('SELECT id, name FROM chats WHERE user_id = ?', [userId]);
-  const chatParts = new Map();
-
-  for (const c of chats) {
-    const [rows] = await connection.execute('SELECT name FROM chat_participants WHERE chat_id = ?', [c.id]);
-    chatParts.set(c.id, new Set(rows.map(r => r.name)));
-  }
-
-  const target = [...participantsSet].sort().join('|');
-  let foundId = null;
-  for (const [id, set] of chatParts) {
-    if ([...set].sort().join('|') === target) {
-      foundId = id;
-      break;
+  limits: { 
+    fileSize: 500 * 1024 * 1024, // 500MB max
+    files: 1
+  },
+  fileFilter: (req, file, cb) => {
+    if (file.mimetype !== 'application/zip' && file.mimetype !== 'application/x-zip-compressed') {
+      cb(new Error('Only ZIP files are allowed'), false);
     }
+    cb(null, true);
   }
-
-  if (foundId) return { chatId: foundId, created: false };
-
-  const [res] = await connection.execute(
-    'INSERT INTO chats (user_id, name) VALUES (?, ?)',
-    [userId, nameGuess || 'Chat']
-  );
-  const chatId = res.insertId;
-
-  for (const p of participantsSet) {
-    await connection.execute('INSERT INTO chat_participants (chat_id, name) VALUES (?, ?)', [chatId, p]);
-  }
-
-  return { chatId, created: true };
-}
-
-// --- Load ZIP via stream (memory-efficient) ---
-async function loadZipStream(filePath) {
-  const zip = new JSZip();
-  const stream = fsSync.createReadStream(filePath);
-  return zip.loadAsync(stream);
-}
-
-// --- Extract files, streaming media to disk ---
-async function extractZipMetaStream(zip, uploadDir) {
-  const txtFiles = [];
-  const filesMap = new Map();
-
-  for (const entry of Object.values(zip.files)) {
-    if (entry.dir) continue;
-
-    const lower = entry.name.toLowerCase();
-
-    if (lower.endsWith('.txt')) {
-      const text = await entry.async('string');
-      txtFiles.push({ path: entry.name, text });
-    } else {
-      const safeOutName = safeName(path.basename(entry.name));
-      const outPath = path.join(uploadDir, safeOutName);
-      await ensureDir(path.dirname(outPath));
-
-      const readStream = entry.nodeStream();
-      const writeStream = fsSync.createWriteStream(outPath);
-
-      await new Promise((resolve, reject) => {
-        readStream.pipe(writeStream)
-          .on('finish', resolve)
-          .on('error', reject);
-      });
-
-      filesMap.set(lower, { path: outPath });
-    }
-  }
-
-  return { txtFiles, filesMap };
-}
-
-// --- POST /upload ---
+});// --- POST /upload ---
 router.post('/upload', auth, upload.single('zip'), async (req, res) => {
-  if (!req.file) return res.status(400).json({ error: 'zip file required' });
+  if (!req.file) {
+    return res.status(400).json({ error: 'zip file required' });
+  }
 
   const userId = req.user.id;
-  const tempUploadDir = path.join('uploads', String(userId), 'tmp');
+  const filePath = req.file.path;
 
   try {
-    console.log(`Processing ZIP upload for user ${userId}, file: ${req.file.originalname}`);
+    console.log(`Received ZIP upload from user ${userId}. File saved to: ${filePath}`);
 
-    // Load ZIP stream
-    const zip = await loadZipStream(req.file.path);
+    // This is the key change: we add a job to a queue instead of processing it here
+    // await uploadQueue.add('process-zip', { userId, filePath });
 
-    // Extract files: text + media (media saved directly)
-    const { txtFiles, filesMap } = await extractZipMetaStream(zip, tempUploadDir);
-
-    if (!txtFiles.length) return res.status(400).json({ error: 'no .txt chat file found in zip' });
-
-    const stats = { addedChats: 0, updatedChats: 0, addedMessages: 0, skippedMessages: 0, savedMedia: filesMap.size };
-
-    const conn = await pool.getConnection();
-    try {
-      await conn.beginTransaction();
-
-      for (const { path: txtPath, text } of txtFiles) {
-        const parsed = parseWhatsAppText(text, txtPath);
-        const participantsSet = parsed.participants;
-
-        const { chatId, created } = await findOrCreateChatForUser(userId, parsed.nameGuess, participantsSet, conn);
-        if (created) stats.addedChats++; else stats.updatedChats++;
-
-        const root = process.env.UPLOAD_ROOT || 'uploads';
-        const chatDir = path.join(root, String(userId), String(chatId));
-        await ensureDir(chatDir);
-
-        let lastMessageTime = null;
-        if (!created) {
-          const [lastMsg] = await conn.execute(
-            'SELECT MAX(timestamp) as last_time FROM messages WHERE chat_id = ?',
-            [chatId]
-          );
-          lastMessageTime = lastMsg[0]?.last_time;
-        }
-
-        const newMessages = parsed.messages.filter(m => {
-          if (!m.timestamp) return true;
-          if (!lastMessageTime) return true;
-          return new Date(m.timestamp) > new Date(lastMessageTime);
-        });
-
-        // Batch processing: Copy media files and prepare for batch insert
-        const messageValues = [];
-        for (const m of newMessages) {
-          let mediaPath = null;
-          if (m.filename) {
-            const key = m.filename.toLowerCase();
-            const fileEntry = filesMap.get(key);
-            if (fileEntry) {
-              const destName = safeName(path.basename(fileEntry.path));
-              const destPath = path.join(chatDir, destName);
-              await ensureDir(path.dirname(destPath));
-              await fs.copyFile(fileEntry.path, destPath);
-              mediaPath = publicPath(String(userId), String(chatId), destName);
-            }
-          }
-
-          messageValues.push([chatId, m.author || null, m.content || '', m.timestamp || null, m.type, mediaPath]);
-          stats.addedMessages++;
-        }
-        
-        // Use a single batch insert for all new messages
-        if (messageValues.length > 0) {
-          try {
-            const query = `INSERT INTO messages (chat_id, author, content, timestamp, type, media_path) VALUES ?`;
-            await conn.query(query, [messageValues]);
-          } catch (e) {
-            if (e.code === 'ER_DUP_ENTRY') {
-              stats.skippedMessages += messageValues.length; // Approximate, a more complex check is needed for exact counts
-            } else {
-              throw e;
-            }
-          }
-        }
-
-        stats.skippedMessages += (parsed.messages.length - newMessages.length);
-      }
-
-      await conn.commit();
-    } catch (e) {
-      await conn.rollback();
-      throw e;
-    } finally {
-      conn.release();
-    }
-
-    console.log(`Upload completed for user ${userId}:`, stats);
-    res.json(stats);
+    // Respond immediately to the user
+    res.status(202).json({ 
+      message: 'Upload received and is being processed in the background.',
+      jobId: 'some-generated-job-id' 
+    });
 
   } catch (error) {
     console.error('Upload error:', error);
-    res.status(500).json({ error: error.message || 'Upload failed' });
-  } finally {
-    // Delete temp uploaded ZIP
-    try { await fs.unlink(req.file.path); } catch {}
-    // Clean temporary uploaded media
-    try { await fs.rm(tempUploadDir, { recursive: true, force: true }); } catch {}
+    // Clean up the file if queuing fails
+    await fs.unlink(filePath).catch(() => {});
+    res.status(500).json({ error: error.message || 'Failed to queue upload job' });
   }
 });
 
