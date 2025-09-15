@@ -7,8 +7,7 @@ import { pool } from '../db.js';
 import { auth } from '../middleware/auth.js';
 import JSZip from 'jszip';
 import { parseWhatsAppText } from '../utils/parseWhatsApp.js';
-import { ensureDir, saveBuffer, publicPath, safeName } from '../utils/file.js';
-import { promisify } from 'util';
+import { ensureDir, publicPath, safeName } from '../utils/file.js';
 
 const router = Router();
 
@@ -22,15 +21,6 @@ const upload = multer({
   storage,
   limits: { fileSize: 500 * 1024 * 1024 } // 500MB max
 });
-
-// --- Processing status tracking ---
-const processingStatus = new Map();
-
-// --- Utility: normalize filenames ---
-function normalizeName(s) {
-  if (!s) return '';
-  return s.toString().toLowerCase().replace(/[^a-z0-9.\-\.]+/g, '');
-}
 
 // --- Helper: find or create chat ---
 async function findOrCreateChatForUser(userId, nameGuess, participantsSet, connection) {
@@ -66,11 +56,9 @@ async function findOrCreateChatForUser(userId, nameGuess, participantsSet, conne
   return { chatId, created: true };
 }
 
-// --- Stream-based ZIP processing (memory efficient) ---
-async function processZipStreamChunked(filePath, uploadDir, progressCallback) {
+// --- Efficient ZIP processing ---
+async function processZipEfficiently(filePath, uploadDir) {
   const zip = new JSZip();
-  
-  // Read file in chunks to avoid memory issues
   const fileBuffer = await fs.readFile(filePath);
   const zipData = await zip.loadAsync(fileBuffer);
   
@@ -78,45 +66,31 @@ async function processZipStreamChunked(filePath, uploadDir, progressCallback) {
   const filesMap = new Map();
   const entries = Object.values(zipData.files);
   
-  let processed = 0;
-  const total = entries.length;
-  
-  // Process entries in smaller batches to avoid blocking
-  const BATCH_SIZE = 10;
-  for (let i = 0; i < entries.length; i += BATCH_SIZE) {
-    const batch = entries.slice(i, i + BATCH_SIZE);
+  for (const entry of entries) {
+    if (entry.dir) continue;
     
-    await Promise.all(batch.map(async (entry) => {
-      if (entry.dir) return;
-      
-      const lower = entry.name.toLowerCase();
-      
-      if (lower.endsWith('.txt')) {
-        const text = await entry.async('string');
-        txtFiles.push({ path: entry.name, text });
-      } else {
-        // Process media files
-        const safeOutName = safeName(path.basename(entry.name));
-        const outPath = path.join(uploadDir, safeOutName);
-        await ensureDir(path.dirname(outPath));
-        
-        // Use streams for large files
-        const buf = await entry.async('nodebuffer');
-        await fs.writeFile(outPath, buf);
-        
-        filesMap.set(lower, { path: outPath });
-      }
-    }));
+    const lower = entry.name.toLowerCase();
     
-    processed += batch.length;
-    if (progressCallback) {
-      progressCallback({ stage: 'extracting', progress: (processed / total) * 50 });
+    if (lower.endsWith('.txt')) {
+      const text = await entry.async('string');
+      txtFiles.push({ path: entry.name, text });
+    } else {
+      const safeOutName = safeName(path.basename(entry.name));
+      const outPath = path.join(uploadDir, safeOutName);
+      await ensureDir(path.dirname(outPath));
+      
+      const readStream = entry.nodeStream();
+      const writeStream = fsSync.createWriteStream(outPath);
+      
+      await new Promise((resolve, reject) => {
+        readStream.pipe(writeStream)
+          .on('finish', resolve)
+          .on('error', reject);
+      });
+      
+      filesMap.set(lower, { path: outPath });
     }
-    
-    // Yield control to event loop
-    await new Promise(resolve => setImmediate(resolve));
   }
-  
   return { txtFiles, filesMap };
 }
 
@@ -124,7 +98,7 @@ async function processZipStreamChunked(filePath, uploadDir, progressCallback) {
 async function batchInsertMessages(messages, chatId, connection) {
   if (messages.length === 0) return { inserted: 0, skipped: 0 };
   
-  const BATCH_SIZE = 100;
+  const BATCH_SIZE = 1000;
   let inserted = 0;
   let skipped = 0;
   
@@ -151,7 +125,6 @@ async function batchInsertMessages(messages, chatId, connection) {
       inserted += result.affectedRows;
     } catch (e) {
       console.error('Batch insert error:', e);
-      // Fall back to individual inserts for this batch
       for (const m of batch) {
         try {
           await connection.execute(
@@ -165,69 +138,25 @@ async function batchInsertMessages(messages, chatId, connection) {
         }
       }
     }
-    
-    // Yield control periodically
-    await new Promise(resolve => setImmediate(resolve));
   }
-  
   return { inserted, skipped };
 }
 
-// --- Background processing function ---
-async function processUploadInBackground(userId, filePath, originalname) {
-  const processId = `${userId}-${Date.now()}`;
-  
-  processingStatus.set(processId, {
-    userId,
-    status: 'processing',
-    progress: 0,
-    stage: 'starting',
-    error: null,
-    result: null
-  });
-
-  const tempUploadDir = path.join('uploads', String(userId), 'tmp', processId);
+// --- The core processing logic ---
+async function processUpload(userId, filePath, originalname) {
+  const tempUploadDir = path.join('uploads', String(userId), 'tmp');
   
   try {
-    console.log(`Starting background processing for user ${userId}, file: ${originalname}`);
-    
-    // Update progress callback
-    const updateProgress = (update) => {
-      const current = processingStatus.get(processId);
-      if (current) {
-        processingStatus.set(processId, { ...current, ...update });
-      }
-    };
-    
-    updateProgress({ stage: 'extracting', progress: 10 });
-    
-    // Extract ZIP with progress tracking
-    const { txtFiles, filesMap } = await processZipStreamChunked(filePath, tempUploadDir, updateProgress);
+    console.log(`Starting processing for user ${userId}, file: ${originalname}`);
+    const { txtFiles, filesMap } = await processZipEfficiently(filePath, tempUploadDir);
     
     if (!txtFiles.length) {
       throw new Error('No .txt chat file found in zip');
     }
     
-    updateProgress({ stage: 'parsing', progress: 60 });
-    
-    const stats = { 
-      addedChats: 0, 
-      updatedChats: 0, 
-      addedMessages: 0, 
-      skippedMessages: 0, 
-      savedMedia: filesMap.size 
-    };
+    const stats = { addedChats: 0, updatedChats: 0, addedMessages: 0, skippedMessages: 0, savedMedia: filesMap.size };
 
-    // Process each chat file
-    for (let fileIndex = 0; fileIndex < txtFiles.length; fileIndex++) {
-      const { path: txtPath, text } = txtFiles[fileIndex];
-      
-      updateProgress({ 
-        stage: 'processing_chats', 
-        progress: 60 + (fileIndex / txtFiles.length) * 30,
-        currentFile: path.basename(txtPath)
-      });
-      
+    for (const { path: txtPath, text } of txtFiles) {
       const conn = await pool.getConnection();
       try {
         await conn.beginTransaction();
@@ -257,7 +186,6 @@ async function processUploadInBackground(userId, filePath, originalname) {
           return new Date(m.timestamp) > new Date(lastMessageTime);
         });
 
-        // Prepare messages with media paths
         const messagesWithMedia = await Promise.all(newMessages.map(async (m) => {
           let mediaPath = null;
           if (m.filename) {
@@ -271,18 +199,12 @@ async function processUploadInBackground(userId, filePath, originalname) {
               mediaPath = publicPath(String(userId), String(chatId), destName);
             }
           }
-          
-          return {
-            ...m,
-            mediaPath
-          };
+          return { ...m, mediaPath };
         }));
 
-        // Batch insert messages
         const { inserted, skipped } = await batchInsertMessages(messagesWithMedia, chatId, conn);
         stats.addedMessages += inserted;
         stats.skippedMessages += skipped + (parsed.messages.length - newMessages.length);
-
         await conn.commit();
       } catch (e) {
         await conn.rollback();
@@ -291,92 +213,29 @@ async function processUploadInBackground(userId, filePath, originalname) {
         conn.release();
       }
     }
-
-    updateProgress({ 
-      stage: 'completed', 
-      progress: 100, 
-      status: 'completed',
-      result: stats
-    });
-    
-    console.log(`Background processing completed for user ${userId}:`, stats);
-    
+    console.log(`Processing completed for user ${userId}:`, stats);
+    return stats;
   } catch (error) {
-    console.error('Background processing error:', error);
-    processingStatus.set(processId, {
-      ...processingStatus.get(processId),
-      status: 'error',
-      error: error.message || 'Processing failed'
-    });
+    console.error('Processing error:', error);
+    throw error;
   } finally {
-    // Cleanup
     try { await fs.unlink(filePath); } catch {}
     try { await fs.rm(tempUploadDir, { recursive: true, force: true }); } catch {}
-    
-    // Remove status after 1 hour
-    setTimeout(() => {
-      processingStatus.delete(processId);
-    }, 3600000);
   }
-  
-  return processId;
 }
 
-// --- POST /upload (now async) ---
+// --- POST /upload (now waits for processing to complete) ---
 router.post('/upload', auth, upload.single('zip'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'zip file required' });
-
   const userId = req.user.id;
-  
   try {
-    // Start background processing
-    const processId = await processUploadInBackground(userId, req.file.path, req.file.originalname);
-    
-    // Return immediately with process ID
-    res.json({
-      message: 'Upload started, processing in background',
-      processId,
-      statusUrl: `/api/upload/status/${processId}`
-    });
-    
+    // This is the key change: we now await the result.
+    const stats = await processUpload(userId, req.file.path, req.file.originalname);
+    res.json(stats);
   } catch (error) {
-    console.error('Upload initialization error:', error);
-    res.status(500).json({ error: error.message || 'Upload failed to start' });
-    
-    // Cleanup on error
-    try { await fs.unlink(req.file.path); } catch {}
+    console.error('Upload failed:', error);
+    res.status(500).json({ error: error.message || 'Upload failed' });
   }
-});
-
-// --- GET /upload/status/:processId ---
-router.get('/status/:processId', auth, (req, res) => {
-  const processId = req.params.processId;
-  const status = processingStatus.get(processId);
-  
-  if (!status) {
-    return res.status(404).json({ error: 'Process not found' });
-  }
-  
-  // Check if user owns this process
-  if (status.userId !== req.user.id) {
-    return res.status(403).json({ error: 'Access denied' });
-  }
-  
-  res.json(status);
-});
-
-// --- GET /upload/processes (list user's active processes) ---
-router.get('/processes', auth, (req, res) => {
-  const userId = req.user.id;
-  const userProcesses = [];
-  
-  for (const [processId, status] of processingStatus.entries()) {
-    if (status.userId === userId) {
-      userProcesses.push({ processId, ...status });
-    }
-  }
-  
-  res.json(userProcesses);
 });
 
 export default router;
