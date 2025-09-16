@@ -12,9 +12,11 @@ import uploadRoutes from './routes/upload.js';
 
 const app = express();
 
-// ✅ Enable CORS (allow frontend domain)
+// Allow all origins, all methods, and credentials
 app.use(cors({
-  origin: process.env.CLIENT_URL || "https://whatsapp-chat-render.vercel.app", // 👈 your frontend domain
+  origin: "*",  // allow all domains
+  methods: ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"],
   credentials: true
 }));
 
