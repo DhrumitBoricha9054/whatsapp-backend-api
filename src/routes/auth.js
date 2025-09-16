@@ -46,4 +46,41 @@ router.post('/logout', auth, async (_req, res) => {
   res.json({ ok: true });
 });
 
+  /** POST /api/change-password {oldPassword, newPassword} (auth required) */
+  router.post('/change-password', auth, async (req, res) => {
+    const userId = req.user.id;
+    const { oldPassword, newPassword } = req.body || {};
+    if (!oldPassword || !newPassword) return res.status(400).json({ error: 'oldPassword & newPassword required' });
+
+    // Get user from DB
+    const [rows] = await pool.execute('SELECT * FROM users WHERE id = ?', [userId]);
+    const user = rows[0];
+    if (!user) return res.status(404).json({ error: 'user not found' });
+
+    // Check old password
+    const ok = await bcrypt.compare(oldPassword, user.password_hash);
+    if (!ok) return res.status(401).json({ error: 'old password incorrect' });
+
+    // Hash new password and update
+    const hash = await bcrypt.hash(newPassword, 10);
+    await pool.execute('UPDATE users SET password_hash = ? WHERE id = ?', [hash, userId]);
+    res.json({ ok: true });
+  });
+
+  /** POST /api/reset-password {username, newPassword} (no auth required) */
+  router.post('/reset-password', async (req, res) => {
+    const { username, newPassword } = req.body || {};
+    if (!username || !newPassword) return res.status(400).json({ error: 'username & newPassword required' });
+
+    // Get user from DB
+    const [rows] = await pool.execute('SELECT * FROM users WHERE username = ?', [username]);
+    const user = rows[0];
+    if (!user) return res.status(404).json({ error: 'user not found' });
+
+    // Hash new password and update
+    const hash = await bcrypt.hash(newPassword, 10);
+    await pool.execute('UPDATE users SET password_hash = ? WHERE username = ?', [hash, username]);
+    res.json({ ok: true });
+  });
+
 export default router;
