@@ -28,7 +28,7 @@ function parseDate(d, t) {
     if (!m) return null;
     hours = Number(m[1]); minutes = Number(m[2]);
   }
-  
+
   const ampm = m[4]?.toLowerCase() || m[3]?.toLowerCase();
 
   if (ampm) {
@@ -36,11 +36,11 @@ function parseDate(d, t) {
     if (ampm === 'am' && hours === 12) hours = 0;
   }
   // local time: store as "YYYY-MM-DD HH:mm:ss"
-  const mmPadded = String(mm).padStart(2,'0');
-  const ddPadded = String(dd).padStart(2,'0');
-  const hhPadded = String(hours).padStart(2,'0');
-  const miPadded = String(minutes).padStart(2,'0');
-  const sePadded = String(seconds).padStart(2,'0');
+  const mmPadded = String(mm).padStart(2, '0');
+  const ddPadded = String(dd).padStart(2, '0');
+  const hhPadded = String(hours).padStart(2, '0');
+  const miPadded = String(minutes).padStart(2, '0');
+  const sePadded = String(seconds).padStart(2, '0');
 
   return `${year}-${mmPadded}-${ddPadded} ${hhPadded}:${miPadded}:${sePadded}`;
 }
@@ -73,9 +73,9 @@ export function parseWhatsAppText(txt, filePath = 'chat.txt') {
     }
     if (filename) {
       const ext = filename.split('.').pop().toLowerCase();
-      if (['jpg','jpeg','png','gif'].includes(ext)) type = 'image';
-      else if (['mp4','mov'].includes(ext)) type = 'video';
-      else if (['mp3','m4a','opus'].includes(ext)) type = 'audio';
+      if (['jpg', 'jpeg', 'png', 'gif'].includes(ext)) type = 'image';
+      else if (['mp4', 'mov'].includes(ext)) type = 'video';
+      else if (['mp3', 'm4a', 'opus'].includes(ext)) type = 'audio';
       else if (ext === 'pdf') type = 'pdf';
       else type = 'file';
     }
@@ -129,8 +129,11 @@ export function parseWhatsAppText(txt, filePath = 'chat.txt') {
   console.log(`Found ${messages.length} total messages, ${participants.size} participants:`, Array.from(participants));
 
   // name guess from filePath
-  const base = filePath.split('/').pop().replace(/\.[Tt][Xx][Tt]$/,'');
-  const nameGuess = base === '_chat' || base === 'chat' ? null : base;
+  // WhatsApp exports typically name the file "WhatsApp Chat with <GroupName>.txt"
+  let base = filePath.split('/').pop().replace(/\.[Tt][Xx][Tt]$/, '');
+  // Strip common WhatsApp export prefixes
+  base = base.replace(/^WhatsApp Chat with\s+/i, '').replace(/^WhatsApp Chat -\s+/i, '').trim();
+  const nameGuess = (!base || base === '_chat' || base === 'chat') ? null : base;
 
   return { nameGuess, participants, messages };
 }
