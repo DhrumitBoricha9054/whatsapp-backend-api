@@ -16,71 +16,121 @@ function normalizeName(s) {
   return s.toString().toLowerCase().replace(/[^a-z0-9.\-\.]+/g, '');
 }
 
-/** Helper: find or create chat for user by name first, then by participants set */
+// Generic/default chat names that indicate the name was not properly parsed
+const GENERIC_NAMES = new Set(['chat', 'whatsapp chat', 'group', '_chat']);
+
+function isGenericName(name) {
+  if (!name) return true;
+  return GENERIC_NAMES.has(name.trim().toLowerCase());
+}
+
+/** Calculate overlap ratio between two participant sets */
+function participantOverlap(setA, setB) {
+  if (setA.size === 0 && setB.size === 0) return 1;
+  if (setA.size === 0 || setB.size === 0) return 0;
+  let overlap = 0;
+  for (const p of setA) {
+    if (setB.has(p)) overlap++;
+  }
+  // Use the smaller set as denominator for a fairer ratio
+  const smaller = Math.min(setA.size, setB.size);
+  return overlap / smaller;
+}
+
+/**
+ * Find or create chat for user — 4-step matching strategy:
+ *   Step 1: Exact name match
+ *   Step 2: 50%+ participant overlap match
+ *   Step 3: Generic-named chat + participant overlap
+ *   Step 4: Create new chat
+ */
 async function findOrCreateChatForUser(userId, nameGuess, participantsSet, connection) {
   // Load all chats for user with their participants
   const [chats] = await connection.execute('SELECT id, name FROM chats WHERE user_id = ?', [userId]);
 
+  // Pre-load participants for all chats
+  const chatParts = new Map(); // chatId -> Set of participant names
+  for (const c of chats) {
+    const [rows] = await connection.execute('SELECT name FROM chat_participants WHERE chat_id = ?', [c.id]);
+    chatParts.set(c.id, new Set(rows.map(r => r.name)));
+  }
+
   let foundId = null;
 
-  // 1) Try matching by chat name first (most reliable for groups)
-  if (nameGuess) {
+  // Step 1: Exact name match (most reliable for named groups)
+  if (nameGuess && !isGenericName(nameGuess)) {
     const nameNorm = nameGuess.trim().toLowerCase();
     for (const c of chats) {
       if (c.name && c.name.trim().toLowerCase() === nameNorm) {
         foundId = c.id;
-        console.log(`Matched chat by name: "${nameGuess}" -> chatId ${foundId}`);
+        console.log(`[Step 1] Matched chat by exact name: "${nameGuess}" -> chatId ${foundId}`);
         break;
       }
     }
   }
 
-  // 2) Fall back to participant set matching
+  // Step 2: 50%+ participant overlap match
   if (!foundId) {
-    const chatParts = new Map();
-    for (const c of chats) {
-      const [rows] = await connection.execute('SELECT name FROM chat_participants WHERE chat_id = ?', [c.id]);
-      const set = new Set(rows.map(r => r.name));
-      chatParts.set(c.id, set);
+    let bestOverlap = 0;
+    let bestId = null;
+
+    for (const [id, existingSet] of chatParts) {
+      const overlap = participantOverlap(participantsSet, existingSet);
+      if (overlap >= 0.5 && overlap > bestOverlap) {
+        bestOverlap = overlap;
+        bestId = id;
+      }
     }
 
-    const target = [...participantsSet].sort().join('|');
-    for (const [id, set] of chatParts) {
-      if ([...set].sort().join('|') === target) {
-        foundId = id;
-        console.log(`Matched chat by participants -> chatId ${foundId}`);
-        break;
+    if (bestId) {
+      foundId = bestId;
+      console.log(`[Step 2] Matched chat by participant overlap (${(bestOverlap * 100).toFixed(0)}%) -> chatId ${foundId}`);
+    }
+  }
+
+  // Step 3: Generic-named chat + any participant overlap
+  if (!foundId) {
+    for (const c of chats) {
+      if (isGenericName(c.name)) {
+        const existingSet = chatParts.get(c.id) || new Set();
+        const overlap = participantOverlap(participantsSet, existingSet);
+        if (overlap > 0) {
+          foundId = c.id;
+          console.log(`[Step 3] Matched generic-named chat ("${c.name}") with participant overlap (${(overlap * 100).toFixed(0)}%) -> chatId ${foundId}`);
+          break;
+        }
       }
     }
   }
 
+  // Found an existing chat — update name & sync participants
   if (foundId) {
-    // Update chat name if previously generic and now we have a real name
-    if (nameGuess) {
+    // Always update chat name to the latest parsed name (newer is more accurate)
+    if (nameGuess && !isGenericName(nameGuess)) {
       const existing = chats.find(c => c.id === foundId);
-      if (!existing.name || existing.name === 'Chat') {
+      if (existing.name !== nameGuess) {
         await connection.execute('UPDATE chats SET name = ? WHERE id = ?', [nameGuess, foundId]);
-        console.log(`Updated chat ${foundId} name to "${nameGuess}"`);
+        console.log(`Updated chat ${foundId} name: "${existing.name}" -> "${nameGuess}"`);
       }
     }
 
-    // Sync participants: add any new ones from this import
-    const [existingParts] = await connection.execute('SELECT name FROM chat_participants WHERE chat_id = ?', [foundId]);
-    const existingSet = new Set(existingParts.map(r => r.name));
+    // Sync participants: merge (union of old + new)
+    const existingSet = chatParts.get(foundId) || new Set();
     for (const p of participantsSet) {
       if (!existingSet.has(p)) {
         await connection.execute('INSERT IGNORE INTO chat_participants (chat_id, name) VALUES (?, ?)', [foundId, p]);
+        console.log(`Added new participant "${p}" to chat ${foundId}`);
       }
     }
 
     return { chatId: foundId, created: false };
   }
 
-  // Create new chat
+  // Step 4: No match found — create new chat
   const [res] = await connection.execute('INSERT INTO chats (user_id, name) VALUES (?, ?)', [userId, nameGuess || 'Chat']);
   const chatId = res.insertId;
+  console.log(`[Step 4] Created new chat: "${nameGuess || 'Chat'}" -> chatId ${chatId}`);
 
-  // Insert participants
   for (const p of participantsSet) {
     await connection.execute('INSERT INTO chat_participants (chat_id, name) VALUES (?, ?)', [chatId, p]);
   }
