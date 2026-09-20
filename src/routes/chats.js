@@ -45,6 +45,52 @@ router.get('/chats/:id', auth, async (req, res) => {
   res.json({ ...chat, participants: parts.map(p => p.name) });
 });
 
+/** PATCH /api/chats/:id - Rename a chat */
+router.patch('/chats/:id', auth, async (req, res) => {
+  const userId = req.user.id;
+  const chatId = Number(req.params.id);
+  const { name } = req.body || {};
+
+  if (!name || !name.trim()) {
+    return res.status(400).json({ error: 'Chat name is required' });
+  }
+
+  const newName = name.trim();
+  const [result] = await pool.execute(
+    'UPDATE chats SET name = ? WHERE id = ? AND user_id = ?',
+    [newName, chatId, userId]
+  );
+
+  if (result.affectedRows === 0) {
+    return res.status(404).json({ error: 'Chat not found or not owned by you' });
+  }
+
+  res.json({ ok: true, id: chatId, name: newName });
+});
+
+/** PUT /api/chats/:id - Rename a chat (alias) */
+router.put('/chats/:id', auth, async (req, res) => {
+  const userId = req.user.id;
+  const chatId = Number(req.params.id);
+  const { name } = req.body || {};
+
+  if (!name || !name.trim()) {
+    return res.status(400).json({ error: 'Chat name is required' });
+  }
+
+  const newName = name.trim();
+  const [result] = await pool.execute(
+    'UPDATE chats SET name = ? WHERE id = ? AND user_id = ?',
+    [newName, chatId, userId]
+  );
+
+  if (result.affectedRows === 0) {
+    return res.status(404).json({ error: 'Chat not found or not owned by you' });
+  }
+
+  res.json({ ok: true, id: chatId, name: newName });
+});
+
 /** DELETE /api/chats/:id */
 
 /** POST /api/chats/merge - Merge multiple chats into one */
